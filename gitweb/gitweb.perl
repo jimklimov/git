@@ -7472,11 +7472,23 @@ sub git_snapshot {
 
 	printf STDERR "Starting git-archive: $cmd\n" if $DEBUG;
 	my $fd;
+	my $OLD_LC_ALL = $ENV{'LC_ALL'};
+	my $OLD_LANG = $ENV{'LANG'};
+	my $OLD_LANGUAGE = $ENV{'LANGUAGE'};
+	$ENV{'LC_ALL'} = 'C';
+	$ENV{'LANG'} = 'C';
+	$ENV{'LANGUAGE'} = 'C';
 	if ( ! open $fd, "-|", $cmd ) {
+		if (defined $OLD_LC_ALL) { $ENV{'LC_ALL'} = $OLD_LC_ALL; } else { undef $ENV{'LC_ALL'} ; }
+		if (defined $OLD_LANG) { $ENV{'LANG'} = $OLD_LANG; } else { undef $ENV{'LANG'} ; }
+		if (defined $OLD_LANGUAGE) { $ENV{'LANGUAGE'} = $OLD_LANGUAGE; } else { undef $ENV{'LANGUAGE'} ; }
 		print $cgi->header(-status => '500 Execute git-archive failed');
 		die_error(500, "Execute git-archive failed");
 		return;
 	}
+	if (defined $OLD_LC_ALL) { $ENV{'LC_ALL'} = $OLD_LC_ALL; } else { undef $ENV{'LC_ALL'} ; }
+	if (defined $OLD_LANG) { $ENV{'LANG'} = $OLD_LANG; } else { undef $ENV{'LANG'} ; }
+	if (defined $OLD_LANGUAGE) { $ENV{'LANGUAGE'} = $OLD_LANGUAGE; } else { undef $ENV{'LANGUAGE'} ; }
 	printf STDERR "Started git-archive...\n" if $DEBUG;
 	my $tempByte;
 	my $readSize = read ($fd, $tempByte, 1);
@@ -7508,7 +7520,16 @@ sub git_snapshot {
 		$retCode = 500;
 		if ( $readSize == 0 ) {
 			# We had empty but not failed read - re-inspect stderr
+			my $OLD_LC_ALL = $ENV{'LC_ALL'};
+			my $OLD_LANG = $ENV{'LANG'};
+			my $OLD_LANGUAGE = $ENV{'LANGUAGE'};
+			$ENV{'LC_ALL'} = 'C';
+			$ENV{'LANG'} = 'C';
+			$ENV{'LANGUAGE'} = 'C';
 			$retError = `$cmd 2>&1`;
+			if (defined $OLD_LC_ALL) { $ENV{'LC_ALL'} = $OLD_LC_ALL; } else { undef $ENV{'LC_ALL'} ; }
+			if (defined $OLD_LANG) { $ENV{'LANG'} = $OLD_LANG; } else { undef $ENV{'LANG'} ; }
+			if (defined $OLD_LANGUAGE) { $ENV{'LANGUAGE'} = $OLD_LANGUAGE; } else { undef $ENV{'LANGUAGE'} ; }
 			if ( $retError =~ /did not match any/ ) {
 				$retCode = 404;
 			}
