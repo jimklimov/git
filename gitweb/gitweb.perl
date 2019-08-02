@@ -21,6 +21,7 @@ use File::Find qw();
 use File::Basename qw(basename);
 use Time::HiRes qw(gettimeofday tv_interval);
 use Digest::MD5 qw(md5_hex);
+use IPC::Run3;
 
 binmode STDOUT, ':utf8';
 
@@ -7471,14 +7472,16 @@ sub git_snapshot {
 	}
 
 	printf STDERR "Starting git-archive: $cmd\n" if $DEBUG;
-	my $fd;
+	my $retErr = "" ;
+	my $retOut = "" ;
+
 	my $OLD_LC_ALL = $ENV{'LC_ALL'};
 	my $OLD_LANG = $ENV{'LANG'};
 	my $OLD_LANGUAGE = $ENV{'LANGUAGE'};
 	$ENV{'LC_ALL'} = 'C';
 	$ENV{'LANG'} = 'C';
 	$ENV{'LANGUAGE'} = 'C';
-	if ( ! open $fd, "-|", $cmd ) {
+	if ( ! run3 \@cmd, \undef, \$retOut, \$retErr || $? != 0 ) {
 		if (defined $OLD_LC_ALL) { $ENV{'LC_ALL'} = $OLD_LC_ALL; } else { undef $ENV{'LC_ALL'} ; }
 		if (defined $OLD_LANG) { $ENV{'LANG'} = $OLD_LANG; } else { undef $ENV{'LANG'} ; }
 		if (defined $OLD_LANGUAGE) { $ENV{'LANGUAGE'} = $OLD_LANGUAGE; } else { undef $ENV{'LANGUAGE'} ; }
@@ -7489,9 +7492,9 @@ sub git_snapshot {
 	if (defined $OLD_LC_ALL) { $ENV{'LC_ALL'} = $OLD_LC_ALL; } else { undef $ENV{'LC_ALL'} ; }
 	if (defined $OLD_LANG) { $ENV{'LANG'} = $OLD_LANG; } else { undef $ENV{'LANG'} ; }
 	if (defined $OLD_LANGUAGE) { $ENV{'LANGUAGE'} = $OLD_LANGUAGE; } else { undef $ENV{'LANGUAGE'} ; }
+
 	printf STDERR "Started git-archive...\n" if $DEBUG;
-	my $tempByte;
-	my $readSize = read ($fd, $tempByte, 1);
+	my $readSize = length $retOut;
 	my $retCode = 200;
 	if ( defined $readSize ) {
 		if ( $readSize > 0 ) {
@@ -7501,8 +7504,7 @@ sub git_snapshot {
 				%co ? (-last_modified => $latest_date{'rfc2822'}) : (),
 				-status => '200 OK' );
 			binmode STDOUT, ':raw';
-			print $tempByte;
-			if ( ! print <$fd> ) {
+			if ( ! print $retOut || $readSize < 2) {
 				$retCode = 503;
 			}
 			binmode STDOUT, ':utf8'; # as set at the beginning of gitweb.cgi
@@ -7514,35 +7516,23 @@ sub git_snapshot {
 		$retCode = 500;
 	}
 
-	close $fd;
-	my $retError = "" ;
 	if ( ($? >> 8) != 0 ) {
 		$retCode = 500;
 		if ( $readSize == 0 ) {
 			# We had empty but not failed read - re-inspect stderr
-			my $OLD_LC_ALL = $ENV{'LC_ALL'};
-			my $OLD_LANG = $ENV{'LANG'};
-			my $OLD_LANGUAGE = $ENV{'LANGUAGE'};
-			$ENV{'LC_ALL'} = 'C';
-			$ENV{'LANG'} = 'C';
-			$ENV{'LANGUAGE'} = 'C';
-			$retError = `$cmd 2>&1`;
-			if (defined $OLD_LC_ALL) { $ENV{'LC_ALL'} = $OLD_LC_ALL; } else { undef $ENV{'LC_ALL'} ; }
-			if (defined $OLD_LANG) { $ENV{'LANG'} = $OLD_LANG; } else { undef $ENV{'LANG'} ; }
-			if (defined $OLD_LANGUAGE) { $ENV{'LANGUAGE'} = $OLD_LANGUAGE; } else { undef $ENV{'LANGUAGE'} ; }
-			if ( $retError =~ /did not match any/ ) {
+			if ( $retErr =~ /did not match any/ ) {
 				$retCode = 404;
 			}
 		}
 	}
-	if ( $retError ne "" ) {
-		$retError = "<br/><pre>$retError</pre><br/>";
+	if ( $retErr ne "" ) {
+		$retErr = "<br/><pre>$retErr</pre><br/>";
 	}
 
 	if ( $retCode == 404 ) {
-		die_error(404, "Not Found - maybe requested objects absent in git path?" . "$retError");
+		die_error(404, "Not Found - maybe requested objects absent in git path?" . "$retErr");
 	} elsif ( $retCode == 500 ) {
-		die_error(500, "Failed to transmit output from git-archive" . "$retError");
+		die_error(500, "Failed to transmit output from git-archive" . "$retErr");
 	}
 
 	printf STDERR "Finished posting output of git-archive...\n" if $DEBUG;
