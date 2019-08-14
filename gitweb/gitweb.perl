@@ -21,6 +21,7 @@ use File::Find qw();
 use File::Basename qw(basename);
 use Time::HiRes qw(gettimeofday tv_interval);
 use Digest::MD5 qw(md5_hex);
+use IPC::Run qw(run start finish);
 
 binmode STDOUT, ':utf8';
 
@@ -7448,20 +7449,19 @@ sub git_snapshot {
 	my %co = parse_commit($hash);
 	exit_if_unmodified_since($co{'committer_epoch'}) if %co;
 
-	my $cmd = quote_command(
-		git_cmd(), 'archive',
+	my @cmd = git_cmd();
+	push( @cmd, (
+		'archive',
 		"--format=$known_snapshot_formats{$format}{'format'}",
-		"--prefix=$prefix/", $hash);
+		"--prefix=$prefix/",
+		"$hash"
+		) );
 	if ($file_name) {
 		# To fetch several pathnames use space-separation, e.g.
 		# "...git-web?p=proj.git;a=snapshot;f=file1%20file2"
 		# To fetch pathnames with spaces, escape them, e.g.
 		# "...git-web?p=proj.git;a=snapshot;f=file\%20name"
-		$cmd .= " " . $file_name;
-	}
-
-	if (exists $known_snapshot_formats{$format}{'compressor'}) {
-		$cmd .= ' | ' . quote_command(@{$known_snapshot_formats{$format}{'compressor'}});
+		push (@cmd, ( "$file_name" ) );
 	}
 
 	$filename =~ s/(["\\])/\\$1/g;
@@ -7470,16 +7470,42 @@ sub git_snapshot {
 		%latest_date = parse_date($co{'committer_epoch'}, $co{'committer_tz'});
 	}
 
-	printf STDERR "Starting git-archive: $cmd\n" if $DEBUG;
-	my $fd;
-	if ( ! open $fd, "-|", $cmd ) {
+	printf STDERR "Starting git-archive: @cmd\n" if $DEBUG;
+	my $gitout;
+	my $giterr;
+	my $gitcode;
+
+	# Note: run() returns TRUE if exit-code is 0, FALSE otherwise,
+	# and raises exceptions for worse conditions with die()
+	eval {
+		if (exists $known_snapshot_formats{$format}{'compressor'}) {
+			run \@cmd, '2>', \$giterr, '|', \@{$known_snapshot_formats{$format}{'compressor'}}, '>', \$gitout;
+		} else {
+			run \@cmd, '>', \$gitout, '2>', \$giterr;
+		}
+		$gitcode = $?;
+		 1;  # always return true to indicate success
+	}
+	or do {
+		$gitcode = $?;
+		my $error = $@ || 'Unknown failure';
 		print $cgi->header(-status => '500 Execute git-archive failed');
+		if ($DEBUG) {
+			printf STDERR "Execute git-archive failed with exit-code $gitcode (" + $error + ")";
+			if ($giterr) {
+				printf STDERR ":\n" . $giterr . "\n";
+				if ($gitout) { printf STDERR "and stdout:\n" . $gitout . "\n"; }
+			} else {
+				printf STDERR "\n";
+			}
+		}
 		die_error(500, "Execute git-archive failed");
 		return;
-	}
+	};
+
 	printf STDERR "Started git-archive...\n" if $DEBUG;
 	my $tempByte;
-	my $readSize = read ($fd, $tempByte, 1);
+	my $readSize = length $gitout;
 	my $retCode = 200;
 	if ( defined $readSize ) {
 		if ( $readSize > 0 ) {
@@ -7489,8 +7515,7 @@ sub git_snapshot {
 				%co ? (-last_modified => $latest_date{'rfc2822'}) : (),
 				-status => '200 OK' );
 			binmode STDOUT, ':raw';
-			print $tempByte;
-			if ( ! print <$fd> ) {
+			if ( ! print $gitout ) {
 				$retCode = 503;
 			}
 			binmode STDOUT, ':utf8'; # as set at the beginning of gitweb.cgi
@@ -7502,13 +7527,12 @@ sub git_snapshot {
 		$retCode = 500;
 	}
 
-	close $fd;
 	my $retError = "" ;
-	if ( ($? >> 8) != 0 ) {
+	if ( ($gitcode >> 8) != 0 ) {
 		$retCode = 500;
 		if ( $readSize == 0 ) {
 			# We had empty but not failed read - re-inspect stderr
-			$retError = `$cmd 2>&1`;
+			$retError = $giterr;
 			if ( $retError =~ /did not match any/ ) {
 				$retCode = 404;
 			}
