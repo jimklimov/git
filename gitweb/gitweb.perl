@@ -1344,7 +1344,7 @@ sub evaluate_argv {
 	);
 }
 
-sub run {
+sub run_gitweb {
 	evaluate_argv();
 
 	$first_request = 1;
@@ -1369,7 +1369,7 @@ sub run {
 	1;
 }
 
-run();
+run_gitweb();
 
 if (defined caller) {
 	# wrapped in a subroutine processing requests,
