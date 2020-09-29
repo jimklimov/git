@@ -10,6 +10,15 @@
 use 5.008;
 use strict;
 use warnings;
+
+# Append path to the script so it can find co-bundled modules.
+# Note however that "use lib" always pre-pends given list into @INC
+# so we must reset and redefine it to give our bundle least priority
+# (use co-bundled modules only if none are provided by the OS distro).
+use FindBin;
+no lib;
+use lib (@lib::ORIG_INC, "$FindBin::Bin");
+
 # handle ACL in file access tests
 use filetest 'access';
 use CGI qw(:standard :escapeHTML -nosticky);
@@ -19,8 +28,10 @@ use Encode;
 use Fcntl ':mode';
 use File::Find qw();
 use File::Basename qw(basename);
+use File::Temp qw(tempfile);
 use Time::HiRes qw(gettimeofday tv_interval);
 use Digest::MD5 qw(md5_hex);
+use IPC::Run qw(run start finish);
 
 binmode STDOUT, ':utf8';
 
@@ -77,6 +88,11 @@ sub evaluate_uri {
 	# target of the home link on top of all pages
 	our $home_link = $my_uri || "/";
 }
+
+# Request parameters
+our ($action, $project, $DEBUG, $file_name, $file_parent, $hash, $hash_parent, $hash_base,
+     $hash_parent_base, @extra_options, $page, $searchtype, $search_use_regexp,
+     $searchtext, $search_regexp, $project_filter);
 
 # core git executable to use
 # this can just be "git" if your webserver has a sensible PATH
@@ -838,6 +854,7 @@ our %input_params = ();
 our @cgi_param_mapping = (
 	project => "p",
 	action => "a",
+	debug => "debug",
 	file_name => "f",
 	file_parent => "fp",
 	hash => "h",
@@ -920,6 +937,7 @@ sub evaluate_query_params {
 # now read PATH_INFO and update the parameter list for missing parameters
 sub evaluate_path_info {
 	return if defined $input_params{'project'};
+	printf STDERR "path_info='$path_info'\n" if $DEBUG;
 	return if !$path_info;
 	$path_info =~ s,^/+,,;
 	return if !$path_info;
@@ -1068,9 +1086,6 @@ sub evaluate_path_info {
 	}
 }
 
-our ($action, $project, $file_name, $file_parent, $hash, $hash_parent, $hash_base,
-     $hash_parent_base, @extra_options, $page, $searchtype, $search_use_regexp,
-     $searchtext, $search_regexp, $project_filter);
 sub evaluate_and_validate_params {
 	our $action = $input_params{'action'};
 	if (defined $action) {
@@ -1086,6 +1101,23 @@ sub evaluate_and_validate_params {
 			undef $project;
 			die_error(404, "No such project");
 		}
+	}
+
+	our $DEBUG = $input_params{'debug'};
+	if (defined $DEBUG) {
+		if ( $DEBUG =~ /^([Yy][Ee][Ss]|[Oo][Nn]|1|[Tt][Rr][Uu][Ee])$/ ) {
+			if ( defined($ENV{'GITWEB_MAY_DEBUG'}) && $ENV{'GITWEB_MAY_DEBUG'} eq "yes" ) {
+				$DEBUG = 1; #true
+			} else {
+				printf STDERR "Invalid action parameter: DEBUG=$DEBUG was requested but server-side GITWEB_MAY_DEBUG=yes is not set\n";
+				die_error(403, "Invalid action parameter: DEBUG was requested but server-side GITWEB_MAY_DEBUG=yes is not set");
+				$DEBUG = 0; #false
+			}
+		} else {
+			$DEBUG = 0; #false
+		}
+	} else {
+		$DEBUG = 0;	# false
 	}
 
 	our $project_filter = $input_params{'project_filter'};
@@ -1336,7 +1368,7 @@ sub evaluate_argv {
 	);
 }
 
-sub run {
+sub run_gitweb {
 	evaluate_argv();
 
 	$first_request = 1;
@@ -1361,7 +1393,7 @@ sub run {
 	1;
 }
 
-run();
+run_gitweb();
 
 if (defined caller) {
 	# wrapped in a subroutine processing requests,
@@ -7380,11 +7412,131 @@ sub exit_if_unmodified_since {
 	}
 }
 
+sub git_snapshot_ls_check {
+	# A helper for git_snapshot() error-classification as defined below
+	# Returns shell exit-code of "git ls" (if under 256) or HTTP code
+	# (404, 500), or 0 for no errors listing this requested pattern.
+	# Note, for a directory (or no argument for whole repo) this looks
+	# at list of all items under it, if any.
+	my ($hash, $file_name_item) = @_;
+	my $retCode = -1;
+
+	my @cmdls = git_cmd();
+	# Potentially we have a choice of "git ls-tree" that has good
+	# support for listing whatever a tree-ish object references,
+	# but lacks direct shell-glob support for filenames like '*.c',
+	# or the "git ls-files" which shows the current workspace (even
+	# if called with "--with-tree=$hash") but supports shell globs.
+	# For our purposes, "git archive" supports simple wildcard globs
+	# (asterisk, but not braced lists or question mark), so we need
+	# to too. There are certain somewhat clumsy workarounds for
+	# each approach (git-ls-tree everything and filter the output,
+	# or use a temporary GIT_INDEX_FILE for git-ls-files)...
+	my $tempfh;
+	my $tempfilename;
+	my $old_GIT_INDEX_FILE;
+	if ( defined $ENV{'GIT_INDEX_FILE'} ) { $old_GIT_INDEX_FILE = $ENV{'GIT_INDEX_FILE'} ; }
+	my $old_GIT_TEST_GETTEXT_POISON;
+	if ( $DEBUG && defined $ENV{'GIT_TEST_GETTEXT_POISON'} ) { $old_GIT_TEST_GETTEXT_POISON = $ENV{'GIT_TEST_GETTEXT_POISON'} ; }
+	if ( defined($file_name_item) && $file_name_item ne "") {
+		# TODO: This wizardry can be refactored if someone uses
+		# many filename patterns as arguments. For one, check if
+		# any wildcard chars are used in this $file_name_item;
+		# for another, set up the GIT_INDEX_FILE once (if needed)
+		# and run the whole loop against it.
+		($tempfh, $tempfilename) = tempfile( ) or die "Can not create a tmp file for git_snapshot_ls_check()";
+		$ENV{'GIT_INDEX_FILE'} = $tempfilename;
+		undef $ENV{'GIT_TEST_GETTEXT_POISON'} if $DEBUG;
+		printf STDERR "Using GIT_INDEX_FILE='$tempfilename'\n" if $DEBUG;
+		my @cmdtmp = @cmdls;
+		push( @cmdtmp, ( 'read-tree', "$hash" ) );
+		run \@cmdtmp or die "Can not populate a tmp file for git_snapshot_ls_check()"; # Populate GIT_INDEX_FILE
+		push( @cmdls, (
+			'ls-files', '--abbrev',
+			'--',
+			"$file_name_item"
+			) );
+	} else {
+		# Ignore the globs hassle, just "git-ls-tree" the $hash
+		push( @cmdls, (
+			'ls-tree', '--abbrev', '--name-only',
+			"$hash"
+			) );
+	}
+
+	printf STDERR "Starting git-ls*: @cmdls\n" if $DEBUG;
+	my $gitlsout;
+	my $gitlserr;
+	my $gitlscode;
+	my $readSizels = -1;
+	eval {
+		run \@cmdls, '>', \$gitlsout, '2>', \$gitlserr;
+		$gitlscode = $?;
+		$readSizels = length $gitlsout if ($gitlsout);
+		if (! defined ($readSizels) ) { $readSizels = -1; }
+		if ( ($gitlscode >> 8) == 0 ) {
+			if ($readSizels <= 0) {
+				printf STDERR "Call to git-ls* succeeded with empty output (indeed no matches for request)\n" if $DEBUG;
+				$retCode = 404;
+			} else {
+				printf STDERR "Call to git-ls* succeeded with non-empty output (something matched in repo, but archive produced nothing)\n" if $DEBUG;
+				$retCode = 0;
+			}
+		} else {
+			my $errorls = $@ || 'Unknown failure';
+			printf STDERR "Call to git-ls* failed with readSizels==$readSizels and exit-code $gitlscode (" . ($gitlscode >> 8) . ") : $errorls: $gitlserr\n" if $DEBUG;
+			$retCode = 500;
+		}
+		1;  # always return true to indicate success
+	}
+	or do {
+		if ( $retCode == -1 ) {
+			$gitlscode = $?;
+			if ( $gitlscode ) {
+				my $errorls = $@ || 'Unknown failure';
+				printf STDERR "Execute git-ls* failed with exit-code $gitlscode (" . ($gitlscode >> 8) . ") : $errorls\n" if $DEBUG;
+			}
+			$retCode = ($gitlscode >> 8);
+		}
+	} ;
+
+	# Restore status-quo
+	if ( defined ($old_GIT_INDEX_FILE) ) {
+		$ENV{'GIT_INDEX_FILE'} = $old_GIT_INDEX_FILE;
+	} else {
+		undef $ENV{'GIT_INDEX_FILE'};
+	}
+	if ( $DEBUG && defined ($old_GIT_TEST_GETTEXT_POISON) ) {
+		$ENV{'GIT_TEST_GETTEXT_POISON'} = $old_GIT_TEST_GETTEXT_POISON;
+	}
+	if ( defined($tempfh) ) { close $tempfh; } # This should also remove the tempfile
+
+	return $retCode;
+}
+
 sub git_snapshot {
 	my $format = $input_params{'snapshot_format'};
 	if (!@snapshot_fmts) {
 		die_error(403, "Snapshots not allowed");
 	}
+
+	if ($DEBUG) {
+		my $v; my $i;
+		printf STDERR "path_info='".$path_info."'\n";
+		printf STDERR "input_params: { ";
+		foreach $i (keys (%input_params)) {
+			$v = $input_params{$i};
+			if (defined ($v)) {
+				if ($i eq "extra_options" ) {
+					printf STDERR "  '$i' => [".@{$v}."] ; ";
+				} else {
+				printf STDERR "  '$i' => '$v' ; ";
+				}
+			}
+		}
+		printf STDERR "} \n";
+	}
+
 	# default to first supported snapshot format
 	$format ||= $snapshot_fmts[0];
 	if ($format !~ m/^[a-z0-9]+$/) {
@@ -7397,6 +7549,15 @@ sub git_snapshot {
 		die_error(403, "Unsupported snapshot format");
 	}
 
+	if (!defined($hash)) {
+		$hash="";
+		if ( $file_name && $file_name =~ /^([^:]*):(.*)$/ ) {
+			$hash = "$1";
+			$file_name = "$2";
+		}
+		if ( $hash eq "") { $hash = "HEAD"; }
+		printf STDERR "Defaulted hash to '$hash' ('h=' URL argument was missing)\n";
+	}
 	my $type = git_get_type("$hash^{}");
 	if (!$type) {
 		die_error(404, 'Object does not exist');
@@ -7407,15 +7568,40 @@ sub git_snapshot {
 	my ($name, $prefix) = snapshot_name($project, $hash);
 	my $filename = "$name$known_snapshot_formats{$format}{'suffix'}";
 
+	if ($DEBUG) {
+		# name of the tarball to generate
+		if (defined $filename)  { printf STDERR "filename='$filename'\n"; }
+		# value of the 'f=' URL parameter
+		if (defined $file_name) { printf STDERR "file_name='$file_name'\n"; }
+	}
+
 	my %co = parse_commit($hash);
 	exit_if_unmodified_since($co{'committer_epoch'}) if %co;
 
-	my $cmd = quote_command(
-		git_cmd(), 'archive',
+	my @cmd = git_cmd();
+	push( @cmd, (
+		'archive',
 		"--format=$known_snapshot_formats{$format}{'format'}",
-		"--prefix=$prefix/", $hash);
-	if (exists $known_snapshot_formats{$format}{'compressor'}) {
-		$cmd .= ' | ' . quote_command(@{$known_snapshot_formats{$format}{'compressor'}});
+		"--prefix=$prefix/",
+		"$hash"
+		) );
+
+	my @file_names = ();
+	if ($file_name) {
+		# To fetch several pathnames use space-separation, e.g.
+		# "...git-web?p=proj.git;a=snapshot;f=file1%20file2"
+		# To fetch pathnames with spaces, escape them, e.g.
+		# "...git-web?p=proj.git;a=snapshot;f=file\%20name"
+		foreach my $file_name_item (split( '(?<!\\\\) ' , "$file_name" )) {
+			$file_name_item =~ s/\\ / /g;
+			push (@file_names, ($file_name_item) );
+			printf STDERR "Would add to git-archive a file_name_item: '$file_name_item'\n" if $DEBUG;
+		}
+	}
+
+	if (@file_names) {
+		push (@cmd, ( '--' ) );
+		push (@cmd, @file_names);
 	}
 
 	$filename =~ s/(["\\])/\\$1/g;
@@ -7424,19 +7610,123 @@ sub git_snapshot {
 		%latest_date = parse_date($co{'committer_epoch'}, $co{'committer_tz'});
 	}
 
-	print $cgi->header(
-		-type => $known_snapshot_formats{$format}{'type'},
-		-content_disposition => 'inline; filename="' . $filename . '"',
-		%co ? (-last_modified => $latest_date{'rfc2822'}) : (),
-		-status => '200 OK');
+	printf STDERR "Starting git-archive: @cmd\n" if $DEBUG;
+	my $gitout;
+	my $giterr;
+	my $gitcode;
+	my $readSize = -1;
 
-	open my $fd, "-|", $cmd
-		or die_error(500, "Execute git-archive failed");
-	local *FCGI::Stream::PRINT = $FCGI_Stream_PRINT_raw;
-	binmode STDOUT, ':raw';
-	print <$fd>;
-	binmode STDOUT, ':utf8'; # as set at the beginning of gitweb.cgi
-	close $fd;
+	# Note: run() returns TRUE if exit-code is 0, FALSE otherwise,
+	# and raises exceptions for worse conditions with die()
+	eval {
+		if (exists $known_snapshot_formats{$format}{'compressor'}) {
+			run \@cmd, '2>', \$giterr, '|', \@{$known_snapshot_formats{$format}{'compressor'}}, '>', \$gitout;
+		} else {
+			run \@cmd, '>', \$gitout, '2>', \$giterr;
+		}
+		$gitcode = $?;
+		$readSize = length $gitout if ($gitout);
+		if (! defined ($readSize) ) { $readSize = -1; }
+		1;  # always return true to indicate success
+	}
+	or do {
+		$gitcode = $?;
+		$readSize = length $gitout if ($gitout);
+		if (! defined ($readSize) ) { $readSize = -1; }
+		my $error = $@ || 'Unknown failure';
+		print $cgi->header(-status => '500 Execute git-archive failed');
+		if ($DEBUG) {
+			printf STDERR "Execute git-archive failed with exit-code $gitcode (" + $error + ")";
+			if ($giterr) {
+				printf STDERR ":\n" . $giterr . "\n";
+				# Assume smaller stdouts do not carry a tarball, may be compressed...
+				# TODO: check so (magic data? file prog? ascii-only content?)
+				if ($readSize > 0 && $readSize < 1000) { printf STDERR "and stdout:\n" . $gitout . "\n"; }
+			} else {
+				printf STDERR "\n";
+			}
+		}
+		die_error(500, "Execute git-archive failed");
+		return;
+	};
+
+	printf STDERR "Started git-archive with exit-code " . $gitcode . " (" . ($gitcode >> 8) . ")...\n" if $DEBUG;
+	my $tempByte;
+	my $retCode = 200;
+	if ( defined $readSize ) {
+		if ( $readSize > 0 ) {
+			printf STDERR "Started git-archive and got some output...\n" if $DEBUG;
+			print $cgi->header(
+				-type => $known_snapshot_formats{$format}{'type'},
+				-content_disposition => 'inline; filename="' . $filename . '"',
+				%co ? (-last_modified => $latest_date{'rfc2822'}) : (),
+				-status => '200 OK' );
+			local *FCGI::Stream::PRINT = $FCGI_Stream_PRINT_raw;
+			binmode STDOUT, ':raw';
+			if ( ! print $gitout ) {
+				$retCode = 503;
+			}
+			binmode STDOUT, ':utf8'; # as set at the beginning of gitweb.cgi
+		} else {
+			printf STDERR "Started git-archive and got no output (readSize==" . $readSize . ")...\n" if $DEBUG;
+			$retCode = 404;
+		}
+	} else {
+		printf STDERR "Started git-archive and got undefined readSize...\n" if $DEBUG;
+		$readSize = -1;
+		$retCode = 500;
+	}
+
+	my $retError = "" ;
+	if ( ($gitcode >> 8) != 0 ) { # e.g. 128
+		$retCode = 500;
+		if ( $readSize <= 0 ) {
+			printf STDERR "We had an empty read - re-inspect stderr\n" if $DEBUG;
+			$retError = $giterr;
+			if ( $retError =~ /did not match any/ ) {
+				$retCode = 404;
+			} else {
+				# In case of unsupported locale, or say a
+				# poisoned gettext, fall back to checking
+				# with "git ls-files" for each pattern
+				if (@file_names) {
+					foreach my $file_name_item (@file_names) {
+						my $retCodels = git_snapshot_ls_check($hash, $file_name_item);
+						printf STDERR "Got retCodels=$retCodels from git_snapshot_ls_check('$hash', '$file_name_item')\n" if $DEBUG;
+						next if ($retCodels == 0);
+						$retCode = $retCodels;
+						last if ($retCodels != 404);
+					}
+				} else {
+					my $retCodels = git_snapshot_ls_check($hash, undef);
+					printf STDERR "Got retCodels=$retCodels from git_snapshot_ls_check('$hash', undef)\n" if $DEBUG;
+					if ($retCodels > 0) {
+						$retCode = $retCodels;
+					} # else keep HTTP-500 for weird behavior
+				}
+			}
+		}
+	}
+	if ( $retError ne "" ) {
+		if ($DEBUG) {
+			printf STDERR "Execute git-archive finally failed with exit-code $gitcode and HTTP code $retCode";
+			if ($giterr) {
+				printf STDERR ":\n" . $giterr . "\n";
+				if ($gitout) { printf STDERR "and stdout:\n" . $gitout . "\n"; }
+			} else {
+				printf STDERR "\n";
+			}
+		}
+		$retError = "<br/><pre>$retError</pre><br/>";
+	}
+
+	if ( $retCode == 404 ) {
+		die_error(404, "Not Found - maybe requested objects absent in git path?" . "$retError");
+	} elsif ( $retCode == 500 ) {
+		die_error(500, "Failed to transmit output from git-archive" . "$retError");
+	}
+
+	printf STDERR "Finished posting output of git-archive...\n" if $DEBUG;
 }
 
 sub git_log_generic {
