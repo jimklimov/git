@@ -22,7 +22,6 @@ use File::Basename qw(basename);
 use File::Temp qw(tempfile);
 use Time::HiRes qw(gettimeofday tv_interval);
 use Digest::MD5 qw(md5_hex);
-use POSIX qw(:sys_wait_h);
 
 binmode STDOUT, ':utf8';
 
@@ -7432,7 +7431,8 @@ sub run_child {
 
 	if ($childpid = fork) {
 		# parent
-		### Our callers reap children! ### $SIG{CHLD} = sub { 1 while ( waitpid(-1, WNOHANG)) > 0 };
+		### Our callers reap children so we do not handle the signal here!
+		###   $SIG{CHLD} = sub { use POSIX qw(:sys_wait_h); 1 while ( waitpid(-1, WNOHANG)) > 0 };
 		close($CHILDIN_R);
 		close($CHILDOUT_W);
 		close($CHILDERR_W);
